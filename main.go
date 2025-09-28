@@ -69,12 +69,14 @@ type Chat struct {
 
 // WhatsApp client manager
 type WhatsAppManager struct {
-	container *sqlstore.Container
-	client    *whatsmeow.Client
-	device    *store.Device
-	mutex     sync.RWMutex
-	isReady   bool
-	connected chan bool
+	container         *sqlstore.Container
+	client            *whatsmeow.Client
+	device            *store.Device
+	mutex             sync.RWMutex
+	isReady           bool
+	connected         chan bool
+	lastPairingAttempt time.Time
+	pairingAttempts   int
 }
 
 var waManager *WhatsAppManager
@@ -174,6 +176,43 @@ func (wm *WhatsAppManager) eventHandler(evt interface{}) {
 func (wm *WhatsAppManager) requestPairingCode(phoneNumber string) (string, error) {
 	log.Printf("🔄 Starting real WhatsApp pairing process for %s", phoneNumber)
 
+	// Check rate limiting
+	wm.mutex.Lock()
+	now := time.Now()
+	timeSinceLastAttempt := now.Sub(wm.lastPairingAttempt)
+
+	// Reset attempt counter if enough time has passed (10 minutes)
+	if timeSinceLastAttempt > 10*time.Minute {
+		wm.pairingAttempts = 0
+	}
+
+	// Calculate required wait time based on attempt number
+	var requiredWait time.Duration
+	switch {
+	case wm.pairingAttempts >= 5:
+		requiredWait = 10 * time.Minute // 10 minutes after 5+ attempts
+	case wm.pairingAttempts >= 3:
+		requiredWait = 5 * time.Minute  // 5 minutes after 3-4 attempts
+	case wm.pairingAttempts >= 1:
+		requiredWait = 2 * time.Minute  // 2 minutes after 1-2 attempts
+	default:
+		requiredWait = 0
+	}
+
+	if timeSinceLastAttempt < requiredWait {
+		waitTime := requiredWait - timeSinceLastAttempt
+		wm.mutex.Unlock()
+		log.Printf("⏳ Rate limiting: need to wait %v before next attempt (attempt #%d)", waitTime.Round(time.Second), wm.pairingAttempts+1)
+		return "", fmt.Errorf("rate limited: please wait %v before trying again", waitTime.Round(time.Second))
+	}
+
+	wm.pairingAttempts++
+	wm.lastPairingAttempt = now
+	currentAttempt := wm.pairingAttempts
+	wm.mutex.Unlock()
+
+	log.Printf("📞 Pairing attempt #%d", currentAttempt)
+
 	// Create client if needed
 	log.Printf("📱 Creating WhatsApp client...")
 	if err := wm.createClient(); err != nil {
@@ -228,6 +267,12 @@ func (wm *WhatsAppManager) requestPairingCode(phoneNumber string) (string, error
 	}
 
 	log.Printf("✅ Generated real WhatsApp pairing code: %s", pairingCode)
+
+	// Reset rate limiting on successful pairing code generation
+	wm.mutex.Lock()
+	wm.pairingAttempts = 0
+	wm.mutex.Unlock()
+
 	return pairingCode, nil
 }
 
@@ -262,6 +307,42 @@ func (wm *WhatsAppManager) cleanup() {
 		wm.client.Disconnect()
 		wm.isReady = false
 	}
+}
+
+func (wm *WhatsAppManager) resetRateLimit() {
+	wm.mutex.Lock()
+	defer wm.mutex.Unlock()
+	wm.pairingAttempts = 0
+	wm.lastPairingAttempt = time.Time{}
+	log.Printf("🔄 Rate limiting reset")
+}
+
+func (wm *WhatsAppManager) getRateLimitStatus() (int, time.Duration) {
+	wm.mutex.RLock()
+	defer wm.mutex.RUnlock()
+
+	timeSinceLastAttempt := time.Since(wm.lastPairingAttempt)
+	return wm.pairingAttempts, timeSinceLastAttempt
+}
+
+func getRemainingWaitTime(attempts int, timeSince time.Duration) time.Duration {
+	var requiredWait time.Duration
+	switch {
+	case attempts >= 5:
+		requiredWait = 10 * time.Minute
+	case attempts >= 3:
+		requiredWait = 5 * time.Minute
+	case attempts >= 1:
+		requiredWait = 2 * time.Minute
+	default:
+		requiredWait = 0
+	}
+
+	remaining := requiredWait - timeSince
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
 }
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -429,6 +510,26 @@ func main() {
 			"status": "healthy",
 			"service": "whatsapp-pairing-server",
 		})
+	})
+	http.HandleFunc("/rate-limit-status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		attempts, timeSince := waManager.getRateLimitStatus()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"attempts": attempts,
+			"time_since_last_attempt": timeSince.String(),
+			"can_retry_in": getRemainingWaitTime(attempts, timeSince).String(),
+		})
+	})
+	http.HandleFunc("/reset-rate-limit", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			waManager.resetRateLimit()
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{
+				"status": "rate limit reset",
+			})
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
 	})
 
 	// Get port
