@@ -438,13 +438,13 @@ func (wm *WhatsAppManager) processHistorySync(evt *events.HistorySync) {
 	log.Printf("📚 Processing history sync with %d conversations", len(evt.Data.Conversations))
 
 	for _, conv := range evt.Data.Conversations {
-		if conv.Id == nil {
+		if conv.ID == nil {
 			continue
 		}
 
-		chatJID, err := types.ParseJID(*conv.Id)
+		chatJID, err := types.ParseJID(*conv.ID)
 		if err != nil {
-			log.Printf("⚠️ Failed to parse JID: %s", *conv.Id)
+			log.Printf("⚠️ Failed to parse JID: %s", *conv.ID)
 			continue
 		}
 
@@ -480,12 +480,19 @@ func (wm *WhatsAppManager) processHistorySync(evt *events.HistorySync) {
 					continue
 				}
 
+				var timestamp int64
+				if histMsg.Message.MessageTimestamp != nil {
+					timestamp = int64(*histMsg.Message.MessageTimestamp)
+				} else {
+					timestamp = time.Now().Unix()
+				}
+
 				message := Message{
 					ID:          histMsg.Message.Key.GetId(),
 					ChatID:      chatJID.String(),
 					ContactName: contactName,
 					Body:        body,
-					Timestamp:   int64(histMsg.Message.MessageTimestamp),
+					Timestamp:   timestamp,
 					IsFromMe:    histMsg.Message.Key.GetFromMe(),
 				}
 
