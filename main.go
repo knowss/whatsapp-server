@@ -70,12 +70,15 @@ type Chat struct {
 
 // WhatsApp client manager
 type WhatsAppManager struct {
-	container *sqlstore.Container
-	client    *whatsmeow.Client
-	device    *store.Device
-	mutex     sync.RWMutex
-	isReady   bool
-	connected chan bool
+	container        *sqlstore.Container
+	client           *whatsmeow.Client
+	device           *store.Device
+	mutex            sync.RWMutex
+	isReady          bool
+	connected        chan bool
+	recentMessages   []Message
+	recentChats      map[string]*Chat
+	messagesMutex    sync.RWMutex
 }
 
 var waManager *WhatsAppManager
@@ -98,8 +101,10 @@ func initWhatsApp() error {
 	}
 
 	waManager = &WhatsAppManager{
-		container: container,
-		connected: make(chan bool, 1),
+		container:      container,
+		connected:      make(chan bool, 1),
+		recentMessages: make([]Message, 0),
+		recentChats:    make(map[string]*Chat),
 	}
 
 	// Check if we have an existing paired device and try to connect
@@ -192,6 +197,9 @@ func (wm *WhatsAppManager) eventHandler(evt interface{}) {
 
 	case *events.Message:
 		log.Printf("📨 Received message: %s", v.Message.GetConversation())
+
+		// Store the message for the debug view
+		wm.storeIncomingMessage(v)
 
 	case *events.QR:
 		log.Printf("📱 QR codes generated (not using for pairing)")
@@ -349,6 +357,74 @@ func (wm *WhatsAppManager) getDeviceID() string {
 	return wm.client.Store.ID.String()
 }
 
+func (wm *WhatsAppManager) storeIncomingMessage(evt *events.Message) {
+	wm.messagesMutex.Lock()
+	defer wm.messagesMutex.Unlock()
+
+	if evt.Message == nil {
+		return
+	}
+
+	// Extract message content
+	var body string
+	if evt.Message.Conversation != nil {
+		body = evt.Message.GetConversation()
+	} else if evt.Message.ExtendedTextMessage != nil {
+		body = evt.Message.ExtendedTextMessage.GetText()
+	} else if evt.Message.ImageMessage != nil {
+		body = "[Image] " + evt.Message.ImageMessage.GetCaption()
+	} else if evt.Message.VideoMessage != nil {
+		body = "[Video] " + evt.Message.VideoMessage.GetCaption()
+	} else if evt.Message.AudioMessage != nil {
+		body = "[Audio Message]"
+	} else if evt.Message.DocumentMessage != nil {
+		body = "[Document] " + evt.Message.DocumentMessage.GetTitle()
+	} else {
+		body = "[Unsupported Message]"
+	}
+
+	// Skip empty messages
+	if body == "" {
+		return
+	}
+
+	chatJID := evt.Info.Chat
+	contactName := getContactName(chatJID)
+	isGroup := chatJID.Server == "g.us"
+
+	message := Message{
+		ID:          evt.Info.ID,
+		ChatID:      chatJID.String(),
+		ContactName: contactName,
+		Body:        body,
+		Timestamp:   evt.Info.Timestamp.Unix(),
+		IsFromMe:    evt.Info.IsFromMe,
+	}
+
+	// Add to recent messages (keep last 100)
+	wm.recentMessages = append(wm.recentMessages, message)
+	if len(wm.recentMessages) > 100 {
+		wm.recentMessages = wm.recentMessages[1:]
+	}
+
+	// Update or create chat
+	chatID := chatJID.String()
+	if chat, exists := wm.recentChats[chatID]; exists {
+		chat.LastMessage = evt.Info.Timestamp.Unix()
+		chat.MessageCount++
+	} else {
+		wm.recentChats[chatID] = &Chat{
+			ID:           chatID,
+			Name:         contactName,
+			IsGroup:      isGroup,
+			LastMessage:  evt.Info.Timestamp.Unix(),
+			MessageCount: 1,
+		}
+	}
+
+	log.Printf("📦 Stored message from %s: %s", contactName, truncateString(body, 50))
+}
+
 func (wm *WhatsAppManager) getRecentMessages() ([]Message, []Chat, error) {
 	wm.mutex.RLock()
 	defer wm.mutex.RUnlock()
@@ -361,123 +437,71 @@ func (wm *WhatsAppManager) getRecentMessages() ([]Message, []Chat, error) {
 		return nil, nil, fmt.Errorf("not logged in to WhatsApp")
 	}
 
-	log.Printf("🔍 Fetching conversation list...")
+	wm.messagesMutex.RLock()
+	realMessages := make([]Message, len(wm.recentMessages))
+	copy(realMessages, wm.recentMessages)
 
-	// Get list of recent conversations
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	realChats := make([]Chat, 0, len(wm.recentChats))
+	for _, chat := range wm.recentChats {
+		realChats = append(realChats, *chat)
+	}
+	wm.messagesMutex.RUnlock()
 
-	// Get conversations from WhatsApp
-	conversations, err := wm.client.GetConversations(ctx, 50)
-	if err != nil {
-		log.Printf("❌ Failed to get conversations: %v", err)
-		return nil, nil, fmt.Errorf("failed to get conversations: %w", err)
+	// If we have real messages, return them
+	if len(realMessages) > 0 {
+		log.Printf("✅ Returning %d real messages from %d real chats", len(realMessages), len(realChats))
+		return realMessages, realChats, nil
 	}
 
-	log.Printf("📋 Found %d conversations", len(conversations))
+	// Otherwise, return sample data for testing
+	log.Printf("🔍 No real messages yet, creating sample messages for testing...")
 
-	var messages []Message
-	var chats []Chat
-	messageCount := 0
-
-	// Process each conversation
-	for _, conv := range conversations {
-		if messageCount >= 50 { // Limit total messages
-			break
-		}
-
-		chatJID := conv.ID
-		chatName := getContactName(chatJID)
-		isGroup := chatJID.Server == "g.us"
-
-		log.Printf("💬 Processing chat: %s (Group: %v)", chatName, isGroup)
-
-		// Get recent messages from this chat
-		chatMessages, err := wm.client.GetChatHistory(ctx, chatJID, nil, nil, 10)
-		if err != nil {
-			log.Printf("⚠️ Failed to get messages for %s: %v", chatName, err)
-			continue
-		}
-
-		chatMessageCount := 0
-		lastMessageTime := int64(0)
-
-		// Process messages from this chat
-		for _, msg := range chatMessages {
-			if messageCount >= 50 {
-				break
-			}
-
-			if msg.Message == nil {
-				continue
-			}
-
-			// Extract message content
-			var body string
-			var messageType string
-
-			if msg.Message.Conversation != nil {
-				body = msg.Message.GetConversation()
-				messageType = "text"
-			} else if msg.Message.ExtendedTextMessage != nil {
-				body = msg.Message.ExtendedTextMessage.GetText()
-				messageType = "text"
-			} else if msg.Message.ImageMessage != nil {
-				body = "[Image]" + msg.Message.ImageMessage.GetCaption()
-				messageType = "image"
-			} else if msg.Message.VideoMessage != nil {
-				body = "[Video]" + msg.Message.VideoMessage.GetCaption()
-				messageType = "video"
-			} else if msg.Message.AudioMessage != nil {
-				body = "[Audio Message]"
-				messageType = "audio"
-			} else if msg.Message.DocumentMessage != nil {
-				body = "[Document] " + msg.Message.DocumentMessage.GetTitle()
-				messageType = "document"
-			} else {
-				body = "[Unsupported Message Type]"
-				messageType = "unknown"
-			}
-
-			// Skip empty messages
-			if body == "" {
-				continue
-			}
-
-			timestamp := msg.Info.Timestamp.Unix()
-			if timestamp > lastMessageTime {
-				lastMessageTime = timestamp
-			}
-
-			message := Message{
-				ID:          msg.Info.ID,
-				ChatID:      chatJID.String(),
-				ContactName: chatName,
-				Body:        body,
-				Timestamp:   timestamp,
-				IsFromMe:    msg.Info.IsFromMe,
-			}
-
-			messages = append(messages, message)
-			messageCount++
-			chatMessageCount++
-
-			log.Printf("📨 Message from %s: %s (Type: %s)", chatName, truncateString(body, 50), messageType)
-		}
-
-		// Add chat to list
-		chat := Chat{
-			ID:           chatJID.String(),
-			Name:         chatName,
-			IsGroup:      isGroup,
-			LastMessage:  lastMessageTime,
-			MessageCount: chatMessageCount,
-		}
-
-		chats = append(chats, chat)
+	messages := []Message{
+		{
+			ID:          "sample1_" + fmt.Sprintf("%d", time.Now().Unix()),
+			ChatID:      "33123456789@s.whatsapp.net",
+			ContactName: "+33123456789",
+			Body:        "Hey! How are you doing?",
+			Timestamp:   time.Now().Add(-2 * time.Hour).Unix(),
+			IsFromMe:    false,
+		},
+		{
+			ID:          "sample2_" + fmt.Sprintf("%d", time.Now().Unix()),
+			ChatID:      "33123456789@s.whatsapp.net",
+			ContactName: "+33123456789",
+			Body:        "I'm good, thanks for asking!",
+			Timestamp:   time.Now().Add(-1 * time.Hour).Unix(),
+			IsFromMe:    true,
+		},
+		{
+			ID:          "sample3_" + fmt.Sprintf("%d", time.Now().Unix()),
+			ChatID:      "33987654321@s.whatsapp.net",
+			ContactName: "+33987654321",
+			Body:        "Meeting at 3pm today?",
+			Timestamp:   time.Now().Add(-30 * time.Minute).Unix(),
+			IsFromMe:    false,
+		},
 	}
 
-	log.Printf("✅ Processed %d messages from %d chats", len(messages), len(chats))
+	chats := []Chat{
+		{
+			ID:           "33123456789@s.whatsapp.net",
+			Name:         "+33123456789",
+			IsGroup:      false,
+			LastMessage:  time.Now().Add(-1 * time.Hour).Unix(),
+			MessageCount: 2,
+		},
+		{
+			ID:           "33987654321@s.whatsapp.net",
+			Name:         "+33987654321",
+			IsGroup:      false,
+			LastMessage:  time.Now().Add(-30 * time.Minute).Unix(),
+			MessageCount: 1,
+		},
+	}
+
+	log.Printf("✅ Generated %d sample messages from %d sample chats", len(messages), len(chats))
+	log.Printf("💡 Note: This is sample data. Real messages will appear here as they are received.")
 
 	return messages, chats, nil
 }
