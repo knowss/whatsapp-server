@@ -79,9 +79,6 @@ type WhatsAppManager struct {
 	recentMessages   []Message
 	recentChats      map[string]*Chat
 	messagesMutex    sync.RWMutex
-	historySyncCount int
-	lastHistorySync  time.Time
-	isCollectingHistory bool
 }
 
 var waManager *WhatsAppManager
@@ -191,25 +188,15 @@ func (wm *WhatsAppManager) eventHandler(evt interface{}) {
 
 		// Request comprehensive message history after connecting
 		go func() {
-			time.Sleep(5 * time.Second) // Wait for connection to stabilize
-			log.Printf("🔄 Auto-requesting ALL available message history...")
-
-			// Wait for any automatic history syncs to complete first
-			time.Sleep(15 * time.Second)
-
-			wm.messagesMutex.RLock()
-			initialCount := len(wm.recentMessages)
-			initialChats := len(wm.recentChats)
-			wm.messagesMutex.RUnlock()
-
-			log.Printf("📊 After automatic history sync: %d messages from %d chats", initialCount, initialChats)
-
-			// If we have very few messages, something might be wrong
-			if initialCount < 100 {
-				log.Printf("⚠️ Only %d messages found - this seems low. WhatsApp may still be syncing...", initialCount)
-			} else {
-				log.Printf("✅ Good message count: %d messages collected", initialCount)
+			time.Sleep(5 * time.Second) // Wait a bit longer for connection to stabilize
+			log.Printf("🔄 Auto-requesting comprehensive message history...")
+			if err := wm.requestRecentHistory(); err != nil {
+				log.Printf("⚠️ Failed to request comprehensive history after connection: %v", err)
 			}
+
+			// Also wait for any additional history syncs
+			time.Sleep(10 * time.Second)
+			log.Printf("📊 Current message count after auto-sync: %d messages from %d chats", len(wm.recentMessages), len(wm.recentChats))
 		}()
 
 	case *events.Disconnected:
@@ -228,24 +215,10 @@ func (wm *WhatsAppManager) eventHandler(evt interface{}) {
 		wm.storeIncomingMessage(v)
 
 	case *events.HistorySync:
-		wm.historySyncCount++
-		wm.lastHistorySync = time.Now()
-		wm.isCollectingHistory = true
+		log.Printf("📚 History sync received, type: %s", v.Data.SyncType.String())
 
-		log.Printf("📚 History sync #%d received, type: %s, conversations: %d", wm.historySyncCount, v.Data.SyncType.String(), len(v.Data.Conversations))
-
-		// Process history sync data (this contains conversation history)
+		// Process history sync data (this contains recent conversation history)
 		wm.processHistorySync(v)
-
-		// Log current totals after processing
-		wm.messagesMutex.RLock()
-		currentCount := len(wm.recentMessages)
-		chatCount := len(wm.recentChats)
-		wm.messagesMutex.RUnlock()
-		log.Printf("📊 After batch #%d: %d total messages from %d chats", wm.historySyncCount, currentCount, chatCount)
-
-		// Start a timer to detect when history sync is complete
-		go wm.monitorHistorySyncCompletion()
 
 	case *events.QR:
 		log.Printf("📱 QR codes generated (not using for pairing)")
@@ -447,9 +420,9 @@ func (wm *WhatsAppManager) storeIncomingMessage(evt *events.Message) {
 		IsFromMe:    evt.Info.IsFromMe,
 	}
 
-	// Add to recent messages (keep last 50000 for complete history)
+	// Add to recent messages (keep last 5000 for comprehensive history)
 	wm.recentMessages = append(wm.recentMessages, message)
-	if len(wm.recentMessages) > 50000 {
+	if len(wm.recentMessages) > 5000 {
 		wm.recentMessages = wm.recentMessages[1:]
 	}
 
@@ -618,9 +591,9 @@ func (wm *WhatsAppManager) processHistorySync(evt *events.HistorySync) {
 		}
 	}
 
-	// Keep up to 50000 messages for complete history coverage
-	if len(wm.recentMessages) > 50000 {
-		// Sort by timestamp and keep the most recent 50000
+	// Keep up to 5000 messages for comprehensive history coverage
+	if len(wm.recentMessages) > 5000 {
+		// Sort by timestamp and keep the most recent 5000
 		for i := 0; i < len(wm.recentMessages)-1; i++ {
 			for j := i + 1; j < len(wm.recentMessages); j++ {
 				if wm.recentMessages[i].Timestamp < wm.recentMessages[j].Timestamp {
@@ -628,7 +601,7 @@ func (wm *WhatsAppManager) processHistorySync(evt *events.HistorySync) {
 				}
 			}
 		}
-		wm.recentMessages = wm.recentMessages[:50000]
+		wm.recentMessages = wm.recentMessages[:5000]
 	}
 
 	log.Printf("✅ Processed history sync: %d total messages across %d chats", len(wm.recentMessages), len(wm.recentChats))
@@ -650,46 +623,6 @@ func (wm *WhatsAppManager) requestRecentHistory() error {
 	log.Printf("🔄 Waiting for automatic history sync events to capture ALL message data")
 
 	return nil
-}
-
-func (wm *WhatsAppManager) monitorHistorySyncCompletion() {
-	// Wait for 30 seconds of no new history sync events to consider it complete
-	time.Sleep(30 * time.Second)
-
-	// Check if we've had any recent history sync activity
-	if wm.isCollectingHistory && time.Since(wm.lastHistorySync) > 25*time.Second {
-		wm.isCollectingHistory = false
-
-		wm.messagesMutex.RLock()
-		finalCount := len(wm.recentMessages)
-		finalChats := len(wm.recentChats)
-		wm.messagesMutex.RUnlock()
-
-		log.Printf("🏁 History sync appears complete after %d batches", wm.historySyncCount)
-		log.Printf("📊 FINAL TOTALS: %d messages from %d chats collected", finalCount, finalChats)
-
-		if finalCount < 1000 {
-			log.Printf("⚠️ WARNING: Only %d messages collected - you likely have more WhatsApp history", finalCount)
-			log.Printf("🔄 Attempting to trigger additional history sync...")
-
-			// Try to trigger more history by forcing a reconnection
-			go func() {
-				time.Sleep(5 * time.Second)
-				if wm.client != nil && wm.client.IsConnected() {
-					log.Printf("🔄 Disconnecting and reconnecting to trigger more history...")
-					wm.client.Disconnect()
-					time.Sleep(2 * time.Second)
-					if err := wm.client.Connect(); err != nil {
-						log.Printf("❌ Reconnection failed: %v", err)
-					} else {
-						log.Printf("✅ Reconnected - waiting for additional history batches...")
-					}
-				}
-			}()
-		} else {
-			log.Printf("✅ Good collection: %d messages seems reasonable for complete history", finalCount)
-		}
-	}
 }
 
 func (wm *WhatsAppManager) getRecentMessages() ([]Message, []Chat, error) {
@@ -743,22 +676,17 @@ func (wm *WhatsAppManager) getRecentMessages() ([]Message, []Chat, error) {
 
 func getContactName(jid types.JID) string {
 	if jid.Server == "g.us" {
-		// Group chat - try to get actual group name
+		// Group chat - use the user part as group name for now
 		if jid.User != "" {
-			// For now, show the group ID - in a real app you'd resolve group names
 			return jid.User + " (Group)"
 		}
 		return "Group Chat"
 	}
 
-	// Individual chat - use phone number with country code
+	// Individual chat - use phone number for now
+	// In a real app, you'd want to resolve this to contact names
 	if jid.User != "" {
-		// Format phone number properly
-		phoneNumber := jid.User
-		if len(phoneNumber) > 0 {
-			// Add + prefix for international format
-			return "+" + phoneNumber
-		}
+		return "+" + jid.User
 	}
 
 	return "Unknown Contact"
@@ -880,46 +808,13 @@ func handleStatusRequest(conn *websocket.Conn, message []byte) {
 	case "requestHistory":
 		// Request message history from WhatsApp
 		if waManager.client != nil && waManager.client.IsLoggedIn() {
-			log.Printf("📚 Manual comprehensive history request triggered")
-
-			// Reset history collection tracking
-			waManager.historySyncCount = 0
-			waManager.isCollectingHistory = true
-			waManager.lastHistorySync = time.Now()
-
+			log.Printf("📚 Manual history request triggered")
 			go func() {
-				log.Printf("🔄 Starting comprehensive history collection process...")
-
-				// First, try the standard history request
 				if err := waManager.requestRecentHistory(); err != nil {
 					log.Printf("❌ Manual history request failed: %v", err)
 				}
-
-				// Wait a bit for initial history sync
-				time.Sleep(10 * time.Second)
-
-				// Check current message count
-				waManager.messagesMutex.RLock()
-				currentCount := len(waManager.recentMessages)
-				waManager.messagesMutex.RUnlock()
-
-				log.Printf("📊 After 10 seconds: %d messages collected so far", currentCount)
-
-				// If we have very few messages, this indicates we need more aggressive collection
-				if currentCount < 1000 {
-					log.Printf("🔄 Low message count - waiting longer for additional history batches...")
-					// Give it more time for additional batches
-					time.Sleep(60 * time.Second)
-
-					waManager.messagesMutex.RLock()
-					finalCount := len(waManager.recentMessages)
-					waManager.messagesMutex.RUnlock()
-
-					log.Printf("📊 After extended wait: %d total messages collected", finalCount)
-				}
 			}()
-
-			sendStatusResponse(conn, true, waManager.getDeviceID(), nil, nil, true, "Comprehensive history collection started")
+			sendStatusResponse(conn, true, waManager.getDeviceID(), nil, nil, true, "History request sent")
 		} else {
 			sendStatusResponse(conn, false, "", nil, nil, false, "Not logged in")
 		}
