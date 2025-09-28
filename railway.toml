@@ -1,0 +1,9 @@
+[build]
+builder = "dockerFile"
+
+[deploy]
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+
+[variables]
+DATABASE_PATH = "/data/whatsapp.db"
