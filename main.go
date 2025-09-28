@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -70,15 +71,18 @@ type Chat struct {
 
 // WhatsApp client manager
 type WhatsAppManager struct {
-	container        *sqlstore.Container
-	client           *whatsmeow.Client
-	device           *store.Device
-	mutex            sync.RWMutex
-	isReady          bool
-	connected        chan bool
-	recentMessages   []Message
-	recentChats      map[string]*Chat
-	messagesMutex    sync.RWMutex
+	container           *sqlstore.Container
+	client              *whatsmeow.Client
+	device              *store.Device
+	mutex               sync.RWMutex
+	isReady             bool
+	connected           chan bool
+	recentMessages      []Message
+	recentChats         map[string]*Chat
+	messagesMutex       sync.RWMutex
+	lastPairingAttempt  time.Time
+	pairingAttemptCount int
+	rateLimitMutex      sync.Mutex
 }
 
 var waManager *WhatsAppManager
@@ -230,8 +234,62 @@ func (wm *WhatsAppManager) eventHandler(evt interface{}) {
 	}
 }
 
+// isRateLimited checks if we should wait before making another pairing request
+func (wm *WhatsAppManager) isRateLimited() (bool, time.Duration) {
+	wm.rateLimitMutex.Lock()
+	defer wm.rateLimitMutex.Unlock()
+
+	now := time.Now()
+
+	// Reset count if it's been more than 15 minutes since last attempt
+	if now.Sub(wm.lastPairingAttempt) > 15*time.Minute {
+		wm.pairingAttemptCount = 0
+	}
+
+	// If we've made 3 or more attempts recently, enforce rate limiting
+	if wm.pairingAttemptCount >= 3 {
+		// Exponential backoff: 2^attempts minutes, max 30 minutes
+		waitMinutes := 1 << wm.pairingAttemptCount
+		if waitMinutes > 30 {
+			waitMinutes = 30
+		}
+		waitDuration := time.Duration(waitMinutes) * time.Minute
+		timeSinceLastAttempt := now.Sub(wm.lastPairingAttempt)
+
+		if timeSinceLastAttempt < waitDuration {
+			remainingWait := waitDuration - timeSinceLastAttempt
+			return true, remainingWait
+		}
+	}
+
+	return false, 0
+}
+
+// recordPairingAttempt records a pairing attempt for rate limiting
+func (wm *WhatsAppManager) recordPairingAttempt() {
+	wm.rateLimitMutex.Lock()
+	defer wm.rateLimitMutex.Unlock()
+
+	wm.lastPairingAttempt = time.Now()
+	wm.pairingAttemptCount++
+}
+
+// resetRateLimit resets the rate limiting counter
+func (wm *WhatsAppManager) resetRateLimit() {
+	wm.rateLimitMutex.Lock()
+	defer wm.rateLimitMutex.Unlock()
+
+	wm.pairingAttemptCount = 0
+}
+
 func (wm *WhatsAppManager) requestPairingCode(phoneNumber string) (string, error) {
 	log.Printf("🔄 Starting real WhatsApp pairing process for %s", phoneNumber)
+
+	// Check rate limiting
+	if isLimited, waitTime := wm.isRateLimited(); isLimited {
+		log.Printf("🚫 Rate limited. Please wait %v before trying again", waitTime)
+		return "", fmt.Errorf("rate limited: please wait %v before trying again", waitTime.Round(time.Second))
+	}
 
 	// Create client if needed
 	log.Printf("📱 Creating WhatsApp client...")
@@ -304,7 +362,10 @@ func (wm *WhatsAppManager) requestPairingCode(phoneNumber string) (string, error
 		return "", fmt.Errorf("timeout waiting for connection")
 	}
 
-	// Request pairing code
+	// Record this pairing attempt
+	wm.recordPairingAttempt()
+
+	// Request pairing code with retry logic
 	log.Printf("📞 Requesting real pairing code for %s", phoneNumber)
 	pairingCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -312,9 +373,19 @@ func (wm *WhatsAppManager) requestPairingCode(phoneNumber string) (string, error
 	pairingCode, err := wm.client.PairPhone(pairingCtx, phoneNumber, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 	if err != nil {
 		log.Printf("❌ Failed to get pairing code: %v", err)
+
+		// Check if it's a rate limit error
+		var iqErr *whatsmeow.IQError
+		if errors.As(err, &iqErr) && iqErr.Code == 429 {
+			log.Printf("🚫 Rate limited by WhatsApp server (429). Wait before trying again.")
+			return "", fmt.Errorf("WhatsApp server rate limit exceeded. Please wait a few minutes before trying again")
+		}
+
 		return "", fmt.Errorf("failed to get pairing code: %w", err)
 	}
 
+	// Reset rate limit on successful pairing code generation
+	wm.resetRateLimit()
 	log.Printf("✅ Generated real WhatsApp pairing code: %s", pairingCode)
 	return pairingCode, nil
 }
@@ -759,7 +830,16 @@ func handlePairingRequest(conn *websocket.Conn, message []byte) {
 	pairingCode, err := waManager.requestPairingCode(req.PhoneNumber)
 	if err != nil {
 		log.Printf("❌ Pairing error: %v", err)
-		sendPairingResponse(conn, "", false, err.Error())
+
+		// Provide user-friendly error messages
+		errorMsg := err.Error()
+		if strings.Contains(errorMsg, "rate limit") {
+			errorMsg = "Too many pairing attempts. Please wait a few minutes before trying again."
+		} else if strings.Contains(errorMsg, "429") {
+			errorMsg = "WhatsApp server is rate limiting requests. Please wait 5-10 minutes before trying again."
+		}
+
+		sendPairingResponse(conn, "", false, errorMsg)
 		return
 	}
 
@@ -834,6 +914,10 @@ func handleStatusRequest(conn *websocket.Conn, message []byte) {
 
 		log.Printf("✅ Fetched %d messages from %d chats", len(messages), len(chats))
 		sendStatusResponse(conn, true, waManager.getDeviceID(), messages, chats, true, "")
+	case "resetRateLimit":
+		waManager.resetRateLimit()
+		log.Printf("🔄 Rate limit reset manually")
+		sendStatusResponse(conn, false, "", nil, nil, true, "Rate limit reset successfully")
 	default:
 		sendStatusResponse(conn, false, "", nil, nil, false, "Unknown action")
 	}
