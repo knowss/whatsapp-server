@@ -448,14 +448,10 @@ func (wm *WhatsAppManager) processHistorySync(evt *events.HistorySync) {
 	wm.messagesMutex.Lock()
 	defer wm.messagesMutex.Unlock()
 
-	log.Printf("📚 Processing comprehensive history sync with %d conversations (Type: %s)", len(evt.Data.Conversations), evt.Data.SyncType.String())
+	log.Printf("📚 Processing history sync with %d conversations (Type: %s)", len(evt.Data.Conversations), evt.Data.SyncType.String())
 
-	// Clear existing messages to avoid duplicates when getting comprehensive history
-	if evt.Data.SyncType.String() == "INITIAL_STATUS_V3" || evt.Data.SyncType.String() == "FULL" {
-		log.Printf("🔄 Full history sync detected - clearing existing messages for fresh data")
-		wm.recentMessages = make([]Message, 0)
-		wm.recentChats = make(map[string]*Chat)
-	}
+	// Don't clear existing messages - just add new ones and deduplicate
+	log.Printf("📋 Adding %d conversations to existing message collection", len(evt.Data.Conversations))
 
 	// Process actual conversations from history sync
 	for _, conv := range evt.Data.Conversations {
@@ -619,51 +615,14 @@ func (wm *WhatsAppManager) requestRecentHistory() error {
 		return fmt.Errorf("client not available or not logged in")
 	}
 
-	log.Printf("📚 Requesting complete message history for all contacts...")
+	log.Printf("📚 Requesting ALL message history from ALL contacts...")
 
-	// In whatsmeow, we need to work with the existing history sync mechanism
-	// and also try to fetch from the local store if available
-	go func() {
-		wm.requestAllStoredMessages()
-	}()
+	// The history sync will automatically include all conversations
+	// We just need to make sure we're processing them correctly
+	log.Printf("💡 WhatsApp will send comprehensive history via events.HistorySync")
+	log.Printf("🔄 Waiting for automatic history sync events to capture ALL message data")
 
-	log.Printf("✅ Comprehensive history request initiated")
 	return nil
-}
-
-func (wm *WhatsAppManager) requestAllStoredMessages() {
-	if wm.client == nil || !wm.client.IsLoggedIn() {
-		log.Printf("❌ Cannot request stored messages - client not available")
-		return
-	}
-
-	log.Printf("🔍 Attempting to get all stored messages...")
-
-	// Try to fetch recent conversations using whatsmeow's built-in methods
-	// Since the direct store access doesn't work, we'll rely on the history sync
-	// and improve the automatic history request
-
-	// Request multiple types of app state to get comprehensive data
-	log.Printf("🔄 Triggering comprehensive app state sync...")
-
-	// For now, log that we're relying on the automatic history sync
-	// The processHistorySync function will handle the incoming data
-	log.Printf("💡 Relying on automatic history sync events to capture comprehensive message data")
-	log.Printf("📚 When WhatsApp sends history sync, all conversations will be processed")
-
-	// We can also trigger a reconnection to potentially get fresh history sync
-	if wm.client.IsConnected() {
-		log.Printf("🔄 Client is connected - history sync should occur automatically")
-	} else {
-		log.Printf("⚠️ Client not connected - attempting to reconnect for fresh history sync")
-		go func() {
-			if err := wm.client.Connect(); err != nil {
-				log.Printf("❌ Reconnection failed: %v", err)
-			} else {
-				log.Printf("✅ Reconnected - waiting for history sync")
-			}
-		}()
-	}
 }
 
 func (wm *WhatsAppManager) getRecentMessages() ([]Message, []Chat, error) {
@@ -695,132 +654,24 @@ func (wm *WhatsAppManager) getRecentMessages() ([]Message, []Chat, error) {
 		log.Printf("📱 Using device phone number: +%s", devicePhone)
 	}
 
-	// If we have real messages, return them
-	if len(realMessages) > 0 {
-		log.Printf("✅ Returning %d real messages from %d real chats", len(realMessages), len(realChats))
-		return realMessages, realChats, nil
+	// Always return real messages if we have them, no matter how many
+	log.Printf("✅ Returning ALL real messages: %d messages from %d real chats", len(realMessages), len(realChats))
+
+	// If no real messages yet, try to request history
+	if len(realMessages) == 0 {
+		log.Printf("📊 No real messages stored yet - requesting comprehensive history...")
+		go func() {
+			time.Sleep(1 * time.Second)
+			if err := wm.requestRecentHistory(); err != nil {
+				log.Printf("⚠️ Auto history request failed: %v", err)
+			}
+		}()
+
+		// Return empty for now - real messages will come via history sync
+		return []Message{}, []Chat{}, nil
 	}
 
-	log.Printf("📊 No real messages stored yet - device is connected but no messages have arrived")
-	log.Printf("🔄 Real messages will appear here automatically as they are received")
-	log.Printf("💬 To test: send a WhatsApp message to +%s from another device", devicePhone)
-
-	// Otherwise, return realistic sample data for testing
-	log.Printf("🔍 No real messages yet, creating realistic sample messages...")
-
-	now := time.Now()
-	messages := []Message{
-		{
-			ID:          "sample1_" + fmt.Sprintf("%d", now.Unix()),
-			ChatID:      "33123456789@s.whatsapp.net",
-			ContactName: "Mom",
-			Body:        "Hey sweetie! How was your day?",
-			Timestamp:   now.Add(-3 * time.Hour).Unix(),
-			IsFromMe:    false,
-		},
-		{
-			ID:          "sample2_" + fmt.Sprintf("%d", now.Unix()),
-			ChatID:      "33123456789@s.whatsapp.net",
-			ContactName: "Mom",
-			Body:        "It was great! Just working on my app 😊",
-			Timestamp:   now.Add(-2 * time.Hour).Unix(),
-			IsFromMe:    true,
-		},
-		{
-			ID:          "sample3_" + fmt.Sprintf("%d", now.Unix()),
-			ChatID:      "33123456789@s.whatsapp.net",
-			ContactName: "Mom",
-			Body:        "That's wonderful! Can't wait to see it",
-			Timestamp:   now.Add(-90 * time.Minute).Unix(),
-			IsFromMe:    false,
-		},
-		{
-			ID:          "sample4_" + fmt.Sprintf("%d", now.Unix()),
-			ChatID:      "33987654321@s.whatsapp.net",
-			ContactName: "Alex",
-			Body:        "Coffee tomorrow at 10am?",
-			Timestamp:   now.Add(-45 * time.Minute).Unix(),
-			IsFromMe:    false,
-		},
-		{
-			ID:          "sample5_" + fmt.Sprintf("%d", now.Unix()),
-			ChatID:      "33987654321@s.whatsapp.net",
-			ContactName: "Alex",
-			Body:        "Perfect! See you at the usual place ☕",
-			Timestamp:   now.Add(-30 * time.Minute).Unix(),
-			IsFromMe:    true,
-		},
-		{
-			ID:          "sample6_" + fmt.Sprintf("%d", now.Unix()),
-			ChatID:      "group123@g.us",
-			ContactName: "Work Team",
-			Body:        "Meeting moved to 2pm tomorrow",
-			Timestamp:   now.Add(-15 * time.Minute).Unix(),
-			IsFromMe:    false,
-		},
-		{
-			ID:          "sample7_" + fmt.Sprintf("%d", now.Unix()),
-			ChatID:      "33555666777@s.whatsapp.net",
-			ContactName: "Sarah",
-			Body:        "Thanks for the help with the project! 🙏",
-			Timestamp:   now.Add(-10 * time.Minute).Unix(),
-			IsFromMe:    false,
-		},
-		{
-			ID:          "sample8_" + fmt.Sprintf("%d", now.Unix()),
-			ChatID:      "33555666777@s.whatsapp.net",
-			ContactName: "Sarah",
-			Body:        "Anytime! Happy to help 😊",
-			Timestamp:   now.Add(-5 * time.Minute).Unix(),
-			IsFromMe:    true,
-		},
-	}
-
-	chats := []Chat{
-		{
-			ID:           "33123456789@s.whatsapp.net",
-			Name:         "Mom",
-			IsGroup:      false,
-			LastMessage:  now.Add(-90 * time.Minute).Unix(),
-			MessageCount: 3,
-		},
-		{
-			ID:           "33987654321@s.whatsapp.net",
-			Name:         "Alex",
-			IsGroup:      false,
-			LastMessage:  now.Add(-30 * time.Minute).Unix(),
-			MessageCount: 2,
-		},
-		{
-			ID:           "group123@g.us",
-			Name:         "Work Team",
-			IsGroup:      true,
-			LastMessage:  now.Add(-15 * time.Minute).Unix(),
-			MessageCount: 1,
-		},
-		{
-			ID:           "33555666777@s.whatsapp.net",
-			Name:         "Sarah",
-			IsGroup:      false,
-			LastMessage:  now.Add(-5 * time.Minute).Unix(),
-			MessageCount: 2,
-		},
-	}
-
-	log.Printf("✅ Generated %d realistic sample messages from %d sample chats", len(messages), len(chats))
-	log.Printf("💡 Note: This is sample data showing what real messages would look like.")
-	log.Printf("📱 To see real messages: send a message to +%s from another device", devicePhone)
-	log.Printf("🔄 Automatically requesting message history...")
-
-	// Try to request history in the background
-	go func() {
-		time.Sleep(1 * time.Second)
-		if err := wm.requestRecentHistory(); err != nil {
-			log.Printf("⚠️ Auto history request failed: %v", err)
-		}
-	}()
-
-	return messages, chats, nil
+	return realMessages, realChats, nil
 }
 
 func getContactName(jid types.JID) string {
