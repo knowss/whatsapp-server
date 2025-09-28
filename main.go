@@ -101,6 +101,32 @@ func initWhatsApp() error {
 		connected: make(chan bool, 1),
 	}
 
+	// Check if we have an existing paired device and try to connect
+	device, err := container.GetFirstDevice(ctx)
+	if err == nil && device.ID != nil {
+		log.Printf("📱 Found existing paired device: %s", device.ID.String())
+		log.Printf("🔄 Attempting to reconnect to existing device...")
+
+		// Create client for existing device
+		if err := waManager.createClient(); err != nil {
+			log.Printf("⚠️ Failed to create client for existing device: %v", err)
+		} else {
+			// Try to connect in background
+			go func() {
+				if !waManager.client.IsConnected() {
+					log.Printf("🔗 Connecting existing device to WhatsApp...")
+					if err := waManager.client.Connect(); err != nil {
+						log.Printf("⚠️ Failed to reconnect existing device: %v", err)
+					} else {
+						log.Printf("✅ Successfully reconnected existing device")
+					}
+				}
+			}()
+		}
+	} else {
+		log.Printf("📱 No existing paired device found")
+	}
+
 	log.Println("✅ WhatsApp manager initialized")
 	return nil
 }
@@ -187,31 +213,40 @@ func (wm *WhatsAppManager) requestPairingCode(phoneNumber string) (string, error
 	}
 
 	// Check if already logged in and connected
-	if wm.client.Store.ID != nil && wm.client.IsLoggedIn() {
-		log.Printf("✅ Already logged in and connected with device ID: %s", wm.client.Store.ID.String())
-		return "ALREADY-LOGGED-IN", nil // Return success instead of error
-	}
+	if wm.client.Store.ID != nil {
+		log.Printf("📱 Device has stored ID: %s", wm.client.Store.ID.String())
 
-	// If we have a stored ID but not connected, try to reconnect
-	if wm.client.Store.ID != nil && !wm.client.IsLoggedIn() {
-		log.Printf("📱 Device paired but not connected, attempting to reconnect...")
+		// Check if client is logged in according to whatsmeow
+		if wm.client.IsLoggedIn() {
+			log.Printf("✅ Already logged in and connected with device ID: %s", wm.client.Store.ID.String())
+			return "ALREADY-LOGGED-IN", nil
+		}
+
+		// If we have a stored ID but not connected, try to connect first
+		log.Printf("📱 Device paired but not connected, attempting to connect...")
 		if !wm.client.IsConnected() {
 			err := wm.client.Connect()
 			if err != nil {
-				log.Printf("❌ Failed to reconnect: %v", err)
-				return "", fmt.Errorf("failed to reconnect: %w", err)
+				log.Printf("❌ Failed to connect: %v", err)
+				// Don't return error immediately, might just need new pairing
+				log.Printf("⚠️ Connection failed, will continue with pairing process")
+			} else {
+				// Wait for connection and check if we're logged in
+				log.Println("⏳ Waiting for connection to establish...")
+				time.Sleep(3 * time.Second)
+
+				if wm.client.IsLoggedIn() {
+					log.Println("✅ Successfully reconnected with existing credentials")
+					return "ALREADY-LOGGED-IN", nil
+				} else {
+					log.Println("⚠️ Connected but not logged in, need new pairing")
+				}
 			}
-			// Wait for connection
-			log.Println("⏳ Waiting for reconnection...")
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			select {
-			case <-wm.connected:
-				log.Println("✅ Reconnected successfully")
+		} else {
+			log.Printf("📡 Client is connected but not logged in, checking status...")
+			if wm.client.IsLoggedIn() {
+				log.Printf("✅ Actually logged in after status check")
 				return "ALREADY-LOGGED-IN", nil
-			case <-ctx.Done():
-				log.Println("❌ Reconnection timeout")
-				// Continue with new pairing process
 			}
 		}
 	}
@@ -261,11 +296,45 @@ func (wm *WhatsAppManager) isLoggedIn() bool {
 	defer wm.mutex.RUnlock()
 
 	if wm.client == nil {
+		log.Printf("🔍 isLoggedIn: client is nil")
 		return false
 	}
 
-	// Check if device is paired AND connected to WhatsApp
-	return wm.client.Store.ID != nil && wm.client.IsLoggedIn()
+	hasDeviceID := wm.client.Store.ID != nil
+	isLoggedIn := wm.client.IsLoggedIn()
+	isConnected := wm.client.IsConnected()
+
+	log.Printf("🔍 Login status check: hasDeviceID=%v, isLoggedIn=%v, isConnected=%v", hasDeviceID, isLoggedIn, isConnected)
+
+	// First check if we have basic requirements
+	if !hasDeviceID {
+		log.Printf("🔍 No device ID stored")
+		return false
+	}
+
+	// If client says we're logged in, we're good
+	if isLoggedIn {
+		log.Printf("🔍 Client reports logged in")
+		return true
+	}
+
+	// If we have a device ID but client says not logged in, try to connect and check again
+	if !isConnected {
+		log.Printf("🔍 Not connected, attempting to connect...")
+		go func() {
+			if err := wm.client.Connect(); err != nil {
+				log.Printf("🔍 Background connection failed: %v", err)
+			} else {
+				log.Printf("🔍 Background connection successful")
+			}
+		}()
+		// Return false for now, connection will happen in background
+		return false
+	}
+
+	// Connected but not logged in - this shouldn't happen if device is properly paired
+	log.Printf("🔍 Connected but not logged in - device may need re-pairing")
+	return false
 }
 
 func (wm *WhatsAppManager) getDeviceID() string {
@@ -362,7 +431,29 @@ func handleStatusRequest(conn *websocket.Conn, message []byte) {
 
 	switch req.Action {
 	case "checkStatus":
-		sendStatusResponse(conn, waManager.isLoggedIn(), waManager.getDeviceID(), nil, nil, true, "")
+		isLoggedIn := waManager.isLoggedIn()
+		deviceID := waManager.getDeviceID()
+		log.Printf("🔍 Status check result: isLoggedIn=%v, deviceID=%s", isLoggedIn, deviceID)
+		sendStatusResponse(conn, isLoggedIn, deviceID, nil, nil, true, "")
+	case "forceReconnect":
+		// Force a reconnection attempt for existing devices
+		if waManager.client != nil && waManager.client.Store.ID != nil {
+			log.Printf("🔄 Force reconnection requested for device: %s", waManager.client.Store.ID.String())
+			go func() {
+				if !waManager.client.IsConnected() {
+					if err := waManager.client.Connect(); err != nil {
+						log.Printf("❌ Force reconnection failed: %v", err)
+					} else {
+						log.Printf("✅ Force reconnection successful")
+					}
+				} else {
+					log.Printf("📡 Already connected, checking login status")
+				}
+			}()
+			sendStatusResponse(conn, false, waManager.getDeviceID(), nil, nil, true, "Reconnection attempt started")
+		} else {
+			sendStatusResponse(conn, false, "", nil, nil, false, "No paired device found")
+		}
 	case "getMessages":
 		if !waManager.isLoggedIn() {
 			sendStatusResponse(conn, false, "", nil, nil, false, "Not logged in")
