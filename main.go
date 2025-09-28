@@ -445,17 +445,149 @@ func (wm *WhatsAppManager) processHistorySync(evt *events.HistorySync) {
 
 	log.Printf("📚 Processing history sync with %d conversations", len(evt.Data.Conversations))
 
-	// For now, just log that we received history sync
-	// The actual message processing will happen through regular message events
-	log.Printf("💡 History sync received - this will trigger message events that we'll capture")
+	// Process actual conversations from history sync
+	for _, conv := range evt.Data.Conversations {
+		if conv.ID == nil {
+			continue
+		}
 
-	// If we have conversations in the history sync, create some mock entries
-	if len(evt.Data.Conversations) > 0 {
-		log.Printf("📊 History sync contains data for %d conversations", len(evt.Data.Conversations))
+		chatJID, err := types.ParseJID(*conv.ID)
+		if err != nil {
+			log.Printf("⚠️ Failed to parse conversation ID: %v", err)
+			continue
+		}
 
-		// This would be where you'd process actual conversation data
-		// For now, we'll rely on the real-time message capture
+		contactName := getContactName(chatJID)
+		isGroup := chatJID.Server == "g.us"
+
+		// Create or update chat
+		chatID := chatJID.String()
+		messageCount := 0
+		var lastMessageTime int64
+
+		// Process messages in this conversation
+		for _, msg := range conv.Messages {
+			if msg.Message == nil || msg.Message.Message == nil {
+				continue
+			}
+
+			// Extract message content
+			var body string
+			waMsg := msg.Message.Message
+			if waMsg.Conversation != nil {
+				body = *waMsg.Conversation
+			} else if waMsg.ExtendedTextMessage != nil && waMsg.ExtendedTextMessage.Text != nil {
+				body = *waMsg.ExtendedTextMessage.Text
+			} else if waMsg.ImageMessage != nil {
+				caption := ""
+				if waMsg.ImageMessage.Caption != nil {
+					caption = *waMsg.ImageMessage.Caption
+				}
+				body = "[Image] " + caption
+			} else if waMsg.VideoMessage != nil {
+				caption := ""
+				if waMsg.VideoMessage.Caption != nil {
+					caption = *waMsg.VideoMessage.Caption
+				}
+				body = "[Video] " + caption
+			} else if waMsg.AudioMessage != nil {
+				body = "[Audio Message]"
+			} else if waMsg.DocumentMessage != nil {
+				title := ""
+				if waMsg.DocumentMessage.Title != nil {
+					title = *waMsg.DocumentMessage.Title
+				}
+				body = "[Document] " + title
+			} else {
+				continue // Skip unsupported message types
+			}
+
+			if body == "" {
+				continue
+			}
+
+			// Get message info
+			timestamp := int64(0)
+			messageID := ""
+			isFromMe := false
+
+			if msg.Message.Key != nil {
+				if msg.Message.Key.ID != nil {
+					messageID = *msg.Message.Key.ID
+				}
+				if msg.Message.Key.FromMe != nil {
+					isFromMe = *msg.Message.Key.FromMe
+				}
+			}
+
+			if msg.Message.MessageTimestamp != nil {
+				timestamp = int64(*msg.Message.MessageTimestamp)
+			}
+
+			// Create message object
+			message := Message{
+				ID:          messageID,
+				ChatID:      chatID,
+				ContactName: contactName,
+				Body:        body,
+				Timestamp:   timestamp,
+				IsFromMe:    isFromMe,
+			}
+
+			// Add to recent messages (avoid duplicates)
+			exists := false
+			for _, existing := range wm.recentMessages {
+				if existing.ID == messageID && existing.ChatID == chatID {
+					exists = true
+					break
+				}
+			}
+
+			if !exists {
+				wm.recentMessages = append(wm.recentMessages, message)
+				messageCount++
+				if timestamp > lastMessageTime {
+					lastMessageTime = timestamp
+				}
+			}
+		}
+
+		// Create or update chat entry
+		if messageCount > 0 {
+			if existingChat, exists := wm.recentChats[chatID]; exists {
+				existingChat.MessageCount += messageCount
+				if lastMessageTime > existingChat.LastMessage {
+					existingChat.LastMessage = lastMessageTime
+				}
+			} else {
+				wm.recentChats[chatID] = &Chat{
+					ID:           chatID,
+					Name:         contactName,
+					IsGroup:      isGroup,
+					LastMessage:  lastMessageTime,
+					MessageCount: messageCount,
+				}
+			}
+		}
 	}
+
+	// Sort messages by timestamp (most recent first)
+	if len(wm.recentMessages) > 1 {
+		for i := 0; i < len(wm.recentMessages)-1; i++ {
+			for j := i + 1; j < len(wm.recentMessages); j++ {
+				if wm.recentMessages[i].Timestamp < wm.recentMessages[j].Timestamp {
+					wm.recentMessages[i], wm.recentMessages[j] = wm.recentMessages[j], wm.recentMessages[i]
+				}
+			}
+		}
+	}
+
+	// Keep only the most recent 100 messages
+	if len(wm.recentMessages) > 100 {
+		wm.recentMessages = wm.recentMessages[:100]
+	}
+
+	log.Printf("✅ Processed history sync: %d total messages across %d chats", len(wm.recentMessages), len(wm.recentChats))
 }
 
 func (wm *WhatsAppManager) requestRecentHistory() error {
@@ -471,17 +603,15 @@ func (wm *WhatsAppManager) requestRecentHistory() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Request history sync with no specific starting point (will get recent messages)
-	historyReq := wm.client.BuildHistorySyncRequest(nil, 50)
-
-	// Send the history request to the user's primary device
-	_, err := wm.client.SendMessage(ctx, wm.client.Store.ID.ToNonAD(), historyReq, whatsmeow.SendRequestExtra{Peer: true})
+	// Request history sync - this automatically triggers events.HistorySync
+	// Using the SendHistorySync method which is the proper way to request history
+	err := wm.client.SendHistorySync(ctx, nil)
 	if err != nil {
-		log.Printf("❌ Failed to request history: %v", err)
-		return fmt.Errorf("failed to request history: %w", err)
+		log.Printf("❌ Failed to request history sync: %v", err)
+		return fmt.Errorf("failed to request history sync: %w", err)
 	}
 
-	log.Printf("✅ History request sent successfully")
+	log.Printf("✅ History sync request sent successfully")
 	return nil
 }
 
