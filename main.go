@@ -110,6 +110,7 @@ func (wm *WhatsAppManager) createClient() error {
 	defer wm.mutex.Unlock()
 
 	if wm.client != nil {
+		log.Printf("📱 WhatsApp client already exists")
 		return nil // Already created
 	}
 
@@ -131,7 +132,11 @@ func (wm *WhatsAppManager) createClient() error {
 	// Add event handler
 	wm.client.AddEventHandler(wm.eventHandler)
 
-	log.Printf("📱 WhatsApp client created for device: %s", device.ID.String())
+	if device.ID != nil {
+		log.Printf("📱 WhatsApp client created for device: %s", device.ID.String())
+	} else {
+		log.Printf("📱 WhatsApp client created for new device (not yet paired)")
+	}
 	return nil
 }
 
@@ -181,18 +186,46 @@ func (wm *WhatsAppManager) requestPairingCode(phoneNumber string) (string, error
 		return "", fmt.Errorf("failed to create client: %w", err)
 	}
 
-	// Check if already logged in
-	if wm.client.Store.ID != nil {
-		log.Printf("✅ Already logged in with device ID: %s", wm.client.Store.ID.String())
+	// Check if already logged in and connected
+	if wm.client.Store.ID != nil && wm.client.IsLoggedIn() {
+		log.Printf("✅ Already logged in and connected with device ID: %s", wm.client.Store.ID.String())
 		return "ALREADY-LOGGED-IN", nil // Return success instead of error
 	}
 
-	// Connect to WhatsApp
-	log.Printf("🔗 Connecting to WhatsApp servers...")
-	err := wm.client.Connect()
-	if err != nil {
-		log.Printf("❌ Failed to connect to WhatsApp: %v", err)
-		return "", fmt.Errorf("failed to connect: %w", err)
+	// If we have a stored ID but not connected, try to reconnect
+	if wm.client.Store.ID != nil && !wm.client.IsLoggedIn() {
+		log.Printf("📱 Device paired but not connected, attempting to reconnect...")
+		if !wm.client.IsConnected() {
+			err := wm.client.Connect()
+			if err != nil {
+				log.Printf("❌ Failed to reconnect: %v", err)
+				return "", fmt.Errorf("failed to reconnect: %w", err)
+			}
+			// Wait for connection
+			log.Println("⏳ Waiting for reconnection...")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			select {
+			case <-wm.connected:
+				log.Println("✅ Reconnected successfully")
+				return "ALREADY-LOGGED-IN", nil
+			case <-ctx.Done():
+				log.Println("❌ Reconnection timeout")
+				// Continue with new pairing process
+			}
+		}
+	}
+
+	// Connect to WhatsApp (only if not already connected)
+	if !wm.client.IsConnected() {
+		log.Printf("🔗 Connecting to WhatsApp servers...")
+		err := wm.client.Connect()
+		if err != nil {
+			log.Printf("❌ Failed to connect to WhatsApp: %v", err)
+			return "", fmt.Errorf("failed to connect: %w", err)
+		}
+	} else {
+		log.Printf("✅ WhatsApp client already connected")
 	}
 
 	// Wait for connection to be ready with shorter timeout
@@ -231,7 +264,8 @@ func (wm *WhatsAppManager) isLoggedIn() bool {
 		return false
 	}
 
-	return wm.client.Store.ID != nil
+	// Check if device is paired AND connected to WhatsApp
+	return wm.client.Store.ID != nil && wm.client.IsLoggedIn()
 }
 
 func (wm *WhatsAppManager) getDeviceID() string {
