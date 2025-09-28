@@ -513,6 +513,10 @@ func (wm *WhatsAppManager) getRecentMessages() ([]Message, []Chat, error) {
 		return realMessages, realChats, nil
 	}
 
+	log.Printf("📊 No real messages stored yet - device is connected but no messages have arrived")
+	log.Printf("🔄 Real messages will appear here automatically as they are received")
+	log.Printf("💬 To test: send a WhatsApp message to +%s from another device", devicePhone)
+
 	// Otherwise, return realistic sample data for testing
 	log.Printf("🔍 No real messages yet, creating realistic sample messages...")
 
@@ -625,6 +629,15 @@ func (wm *WhatsAppManager) getRecentMessages() ([]Message, []Chat, error) {
 	log.Printf("✅ Generated %d realistic sample messages from %d sample chats", len(messages), len(chats))
 	log.Printf("💡 Note: This is sample data showing what real messages would look like.")
 	log.Printf("📱 To see real messages: send a message to +%s from another device", devicePhone)
+	log.Printf("🔄 Automatically requesting message history...")
+
+	// Try to request history in the background
+	go func() {
+		time.Sleep(1 * time.Second)
+		if err := wm.requestRecentHistory(); err != nil {
+			log.Printf("⚠️ Auto history request failed: %v", err)
+		}
+	}()
 
 	return messages, chats, nil
 }
