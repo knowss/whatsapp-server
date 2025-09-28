@@ -187,6 +187,14 @@ func (wm *WhatsAppManager) requestPairingCode(phoneNumber string) (string, error
 		return "", fmt.Errorf("already logged in with device ID: %s", wm.client.Store.ID.String())
 	}
 
+	// Disconnect any existing connection before attempting to connect
+	if wm.client.IsConnected() {
+		log.Printf("🔌 Disconnecting existing connection...")
+		wm.client.Disconnect()
+		// Give it a moment to fully disconnect
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	// Connect to WhatsApp
 	log.Printf("🔗 Connecting to WhatsApp servers...")
 	err := wm.client.Connect()
@@ -245,13 +253,29 @@ func (wm *WhatsAppManager) getDeviceID() string {
 	return wm.client.Store.ID.String()
 }
 
+func (wm *WhatsAppManager) cleanup() {
+	wm.mutex.Lock()
+	defer wm.mutex.Unlock()
+
+	if wm.client != nil && wm.client.IsConnected() {
+		log.Printf("🧹 Cleaning up WhatsApp connection...")
+		wm.client.Disconnect()
+		wm.isReady = false
+	}
+}
+
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("❌ WebSocket upgrade failed: %v", err)
 		return
 	}
-	defer conn.Close()
+	defer func() {
+		conn.Close()
+		// Clean up WhatsApp connection when WebSocket disconnects
+		waManager.cleanup()
+		log.Println("🔌 iOS app disconnected, cleaned up WhatsApp connection")
+	}()
 
 	log.Println("📱 iOS app connected")
 
