@@ -507,6 +507,13 @@ func (wm *WhatsAppManager) getRecentMessages() ([]Message, []Chat, error) {
 	}
 	wm.messagesMutex.RUnlock()
 
+	// Get the current device phone number for logging and sample data
+	devicePhone := "33685606511" // Default, will be updated if device is available
+	if wm.client != nil && wm.client.Store.ID != nil {
+		devicePhone = wm.client.Store.ID.User
+		log.Printf("📱 Using device phone number: +%s", devicePhone)
+	}
+
 	// If we have real messages, return them
 	if len(realMessages) > 0 {
 		log.Printf("✅ Returning %d real messages from %d real chats", len(realMessages), len(realChats))
@@ -519,13 +526,6 @@ func (wm *WhatsAppManager) getRecentMessages() ([]Message, []Chat, error) {
 
 	// Otherwise, return realistic sample data for testing
 	log.Printf("🔍 No real messages yet, creating realistic sample messages...")
-
-	// Get the current device phone number for more realistic sample data
-	devicePhone := "33685606511" // Default, will be updated if device is available
-	if wm.client != nil && wm.client.Store.ID != nil {
-		devicePhone = wm.client.Store.ID.User
-		log.Printf("📱 Using device phone number: +%s", devicePhone)
-	}
 
 	now := time.Now()
 	messages := []Message{
