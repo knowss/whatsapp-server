@@ -15,6 +15,7 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	_ "github.com/mattn/go-sqlite3"
@@ -348,6 +349,164 @@ func (wm *WhatsAppManager) getDeviceID() string {
 	return wm.client.Store.ID.String()
 }
 
+func (wm *WhatsAppManager) getRecentMessages() ([]Message, []Chat, error) {
+	wm.mutex.RLock()
+	defer wm.mutex.RUnlock()
+
+	if wm.client == nil {
+		return nil, nil, fmt.Errorf("client not initialized")
+	}
+
+	if !wm.client.IsLoggedIn() {
+		return nil, nil, fmt.Errorf("not logged in to WhatsApp")
+	}
+
+	log.Printf("🔍 Fetching conversation list...")
+
+	// Get list of recent conversations
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Get conversations from WhatsApp
+	conversations, err := wm.client.GetConversations(ctx, 50)
+	if err != nil {
+		log.Printf("❌ Failed to get conversations: %v", err)
+		return nil, nil, fmt.Errorf("failed to get conversations: %w", err)
+	}
+
+	log.Printf("📋 Found %d conversations", len(conversations))
+
+	var messages []Message
+	var chats []Chat
+	messageCount := 0
+
+	// Process each conversation
+	for _, conv := range conversations {
+		if messageCount >= 50 { // Limit total messages
+			break
+		}
+
+		chatJID := conv.ID
+		chatName := getContactName(chatJID)
+		isGroup := chatJID.Server == "g.us"
+
+		log.Printf("💬 Processing chat: %s (Group: %v)", chatName, isGroup)
+
+		// Get recent messages from this chat
+		chatMessages, err := wm.client.GetChatHistory(ctx, chatJID, nil, nil, 10)
+		if err != nil {
+			log.Printf("⚠️ Failed to get messages for %s: %v", chatName, err)
+			continue
+		}
+
+		chatMessageCount := 0
+		lastMessageTime := int64(0)
+
+		// Process messages from this chat
+		for _, msg := range chatMessages {
+			if messageCount >= 50 {
+				break
+			}
+
+			if msg.Message == nil {
+				continue
+			}
+
+			// Extract message content
+			var body string
+			var messageType string
+
+			if msg.Message.Conversation != nil {
+				body = msg.Message.GetConversation()
+				messageType = "text"
+			} else if msg.Message.ExtendedTextMessage != nil {
+				body = msg.Message.ExtendedTextMessage.GetText()
+				messageType = "text"
+			} else if msg.Message.ImageMessage != nil {
+				body = "[Image]" + msg.Message.ImageMessage.GetCaption()
+				messageType = "image"
+			} else if msg.Message.VideoMessage != nil {
+				body = "[Video]" + msg.Message.VideoMessage.GetCaption()
+				messageType = "video"
+			} else if msg.Message.AudioMessage != nil {
+				body = "[Audio Message]"
+				messageType = "audio"
+			} else if msg.Message.DocumentMessage != nil {
+				body = "[Document] " + msg.Message.DocumentMessage.GetTitle()
+				messageType = "document"
+			} else {
+				body = "[Unsupported Message Type]"
+				messageType = "unknown"
+			}
+
+			// Skip empty messages
+			if body == "" {
+				continue
+			}
+
+			timestamp := msg.Info.Timestamp.Unix()
+			if timestamp > lastMessageTime {
+				lastMessageTime = timestamp
+			}
+
+			message := Message{
+				ID:          msg.Info.ID,
+				ChatID:      chatJID.String(),
+				ContactName: chatName,
+				Body:        body,
+				Timestamp:   timestamp,
+				IsFromMe:    msg.Info.IsFromMe,
+			}
+
+			messages = append(messages, message)
+			messageCount++
+			chatMessageCount++
+
+			log.Printf("📨 Message from %s: %s (Type: %s)", chatName, truncateString(body, 50), messageType)
+		}
+
+		// Add chat to list
+		chat := Chat{
+			ID:           chatJID.String(),
+			Name:         chatName,
+			IsGroup:      isGroup,
+			LastMessage:  lastMessageTime,
+			MessageCount: chatMessageCount,
+		}
+
+		chats = append(chats, chat)
+	}
+
+	log.Printf("✅ Processed %d messages from %d chats", len(messages), len(chats))
+
+	return messages, chats, nil
+}
+
+func getContactName(jid types.JID) string {
+	if jid.Server == "g.us" {
+		// Group chat - use the user part as group name for now
+		if jid.User != "" {
+			return jid.User + " (Group)"
+		}
+		return "Group Chat"
+	}
+
+	// Individual chat - use phone number for now
+	// In a real app, you'd want to resolve this to contact names
+	if jid.User != "" {
+		return "+" + jid.User
+	}
+
+	return "Unknown Contact"
+}
+
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
+}
+
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -459,26 +618,16 @@ func handleStatusRequest(conn *websocket.Conn, message []byte) {
 			sendStatusResponse(conn, false, "", nil, nil, false, "Not logged in")
 			return
 		}
-		// Return mock data for now
-		messages := []Message{
-			{
-				ID:          "msg1",
-				ChatID:      "chat1",
-				ContactName: "Mom",
-				Body:        "How are you doing?",
-				Timestamp:   time.Now().Unix(),
-				IsFromMe:    false,
-			},
+
+		log.Printf("📥 Fetching real WhatsApp messages...")
+		messages, chats, err := waManager.getRecentMessages()
+		if err != nil {
+			log.Printf("❌ Failed to fetch messages: %v", err)
+			sendStatusResponse(conn, true, waManager.getDeviceID(), nil, nil, false, fmt.Sprintf("Failed to fetch messages: %v", err))
+			return
 		}
-		chats := []Chat{
-			{
-				ID:           "chat1",
-				Name:         "Mom",
-				IsGroup:      false,
-				LastMessage:  time.Now().Unix(),
-				MessageCount: 1,
-			},
-		}
+
+		log.Printf("✅ Fetched %d messages from %d chats", len(messages), len(chats))
 		sendStatusResponse(conn, true, waManager.getDeviceID(), messages, chats, true, "")
 	default:
 		sendStatusResponse(conn, false, "", nil, nil, false, "Unknown action")
