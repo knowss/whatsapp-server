@@ -201,6 +201,12 @@ func (wm *WhatsAppManager) eventHandler(evt interface{}) {
 		// Store the message for the debug view
 		wm.storeIncomingMessage(v)
 
+	case *events.HistorySync:
+		log.Printf("📚 History sync received with %d conversations", len(v.Data.Conversations))
+
+		// Process history sync data (this contains recent conversation history)
+		wm.processHistorySync(v)
+
 	case *events.QR:
 		log.Printf("📱 QR codes generated (not using for pairing)")
 		// We don't use QR codes for pairing, but this event indicates connection readiness
@@ -425,6 +431,93 @@ func (wm *WhatsAppManager) storeIncomingMessage(evt *events.Message) {
 	log.Printf("📦 Stored message from %s: %s", contactName, truncateString(body, 50))
 }
 
+func (wm *WhatsAppManager) processHistorySync(evt *events.HistorySync) {
+	wm.messagesMutex.Lock()
+	defer wm.messagesMutex.Unlock()
+
+	log.Printf("📚 Processing history sync with %d conversations", len(evt.Data.Conversations))
+
+	for _, conv := range evt.Data.Conversations {
+		if conv.Id == nil {
+			continue
+		}
+
+		chatJID, err := types.ParseJID(*conv.Id)
+		if err != nil {
+			log.Printf("⚠️ Failed to parse JID: %s", *conv.Id)
+			continue
+		}
+
+		contactName := getContactName(chatJID)
+		isGroup := chatJID.Server == "g.us"
+
+		// Get the most recent messages from this conversation
+		messageCount := 0
+		if conv.Messages != nil {
+			for _, histMsg := range conv.Messages {
+				if histMsg.Message == nil || histMsg.Message.Message == nil {
+					continue
+				}
+
+				msg := histMsg.Message.Message
+				var body string
+
+				if msg.Conversation != nil {
+					body = msg.GetConversation()
+				} else if msg.ExtendedTextMessage != nil {
+					body = msg.ExtendedTextMessage.GetText()
+				} else if msg.ImageMessage != nil {
+					body = "[Image] " + msg.ImageMessage.GetCaption()
+				} else if msg.VideoMessage != nil {
+					body = "[Video] " + msg.VideoMessage.GetCaption()
+				} else if msg.AudioMessage != nil {
+					body = "[Audio Message]"
+				} else {
+					body = "[Message]"
+				}
+
+				if body == "" {
+					continue
+				}
+
+				message := Message{
+					ID:          histMsg.Message.Key.GetId(),
+					ChatID:      chatJID.String(),
+					ContactName: contactName,
+					Body:        body,
+					Timestamp:   int64(histMsg.Message.MessageTimestamp),
+					IsFromMe:    histMsg.Message.Key.GetFromMe(),
+				}
+
+				wm.recentMessages = append(wm.recentMessages, message)
+				messageCount++
+
+				if messageCount >= 5 { // Limit messages per conversation
+					break
+				}
+			}
+		}
+
+		// Update chat info
+		wm.recentChats[chatJID.String()] = &Chat{
+			ID:           chatJID.String(),
+			Name:         contactName,
+			IsGroup:      isGroup,
+			LastMessage:  time.Now().Unix(), // Use current time as approximation
+			MessageCount: messageCount,
+		}
+
+		log.Printf("📝 Processed %d messages from %s", messageCount, contactName)
+	}
+
+	// Keep only the most recent 100 messages
+	if len(wm.recentMessages) > 100 {
+		wm.recentMessages = wm.recentMessages[len(wm.recentMessages)-100:]
+	}
+
+	log.Printf("✅ History sync complete - total stored messages: %d", len(wm.recentMessages))
+}
+
 func (wm *WhatsAppManager) getRecentMessages() ([]Message, []Chat, error) {
 	wm.mutex.RLock()
 	defer wm.mutex.RUnlock()
@@ -453,55 +546,118 @@ func (wm *WhatsAppManager) getRecentMessages() ([]Message, []Chat, error) {
 		return realMessages, realChats, nil
 	}
 
-	// Otherwise, return sample data for testing
-	log.Printf("🔍 No real messages yet, creating sample messages for testing...")
+	// Otherwise, return realistic sample data for testing
+	log.Printf("🔍 No real messages yet, creating realistic sample messages...")
 
+	// Get the current device phone number for more realistic sample data
+	devicePhone := "33685606511" // Default, will be updated if device is available
+	if wm.client != nil && wm.client.Store.ID != nil {
+		devicePhone = wm.client.Store.ID.User
+		log.Printf("📱 Using device phone number: +%s", devicePhone)
+	}
+
+	now := time.Now()
 	messages := []Message{
 		{
-			ID:          "sample1_" + fmt.Sprintf("%d", time.Now().Unix()),
+			ID:          "sample1_" + fmt.Sprintf("%d", now.Unix()),
 			ChatID:      "33123456789@s.whatsapp.net",
-			ContactName: "+33123456789",
-			Body:        "Hey! How are you doing?",
-			Timestamp:   time.Now().Add(-2 * time.Hour).Unix(),
+			ContactName: "Mom",
+			Body:        "Hey sweetie! How was your day?",
+			Timestamp:   now.Add(-3 * time.Hour).Unix(),
 			IsFromMe:    false,
 		},
 		{
-			ID:          "sample2_" + fmt.Sprintf("%d", time.Now().Unix()),
+			ID:          "sample2_" + fmt.Sprintf("%d", now.Unix()),
 			ChatID:      "33123456789@s.whatsapp.net",
-			ContactName: "+33123456789",
-			Body:        "I'm good, thanks for asking!",
-			Timestamp:   time.Now().Add(-1 * time.Hour).Unix(),
+			ContactName: "Mom",
+			Body:        "It was great! Just working on my app 😊",
+			Timestamp:   now.Add(-2 * time.Hour).Unix(),
 			IsFromMe:    true,
 		},
 		{
-			ID:          "sample3_" + fmt.Sprintf("%d", time.Now().Unix()),
-			ChatID:      "33987654321@s.whatsapp.net",
-			ContactName: "+33987654321",
-			Body:        "Meeting at 3pm today?",
-			Timestamp:   time.Now().Add(-30 * time.Minute).Unix(),
+			ID:          "sample3_" + fmt.Sprintf("%d", now.Unix()),
+			ChatID:      "33123456789@s.whatsapp.net",
+			ContactName: "Mom",
+			Body:        "That's wonderful! Can't wait to see it",
+			Timestamp:   now.Add(-90 * time.Minute).Unix(),
 			IsFromMe:    false,
+		},
+		{
+			ID:          "sample4_" + fmt.Sprintf("%d", now.Unix()),
+			ChatID:      "33987654321@s.whatsapp.net",
+			ContactName: "Alex",
+			Body:        "Coffee tomorrow at 10am?",
+			Timestamp:   now.Add(-45 * time.Minute).Unix(),
+			IsFromMe:    false,
+		},
+		{
+			ID:          "sample5_" + fmt.Sprintf("%d", now.Unix()),
+			ChatID:      "33987654321@s.whatsapp.net",
+			ContactName: "Alex",
+			Body:        "Perfect! See you at the usual place ☕",
+			Timestamp:   now.Add(-30 * time.Minute).Unix(),
+			IsFromMe:    true,
+		},
+		{
+			ID:          "sample6_" + fmt.Sprintf("%d", now.Unix()),
+			ChatID:      "group123@g.us",
+			ContactName: "Work Team",
+			Body:        "Meeting moved to 2pm tomorrow",
+			Timestamp:   now.Add(-15 * time.Minute).Unix(),
+			IsFromMe:    false,
+		},
+		{
+			ID:          "sample7_" + fmt.Sprintf("%d", now.Unix()),
+			ChatID:      "33555666777@s.whatsapp.net",
+			ContactName: "Sarah",
+			Body:        "Thanks for the help with the project! 🙏",
+			Timestamp:   now.Add(-10 * time.Minute).Unix(),
+			IsFromMe:    false,
+		},
+		{
+			ID:          "sample8_" + fmt.Sprintf("%d", now.Unix()),
+			ChatID:      "33555666777@s.whatsapp.net",
+			ContactName: "Sarah",
+			Body:        "Anytime! Happy to help 😊",
+			Timestamp:   now.Add(-5 * time.Minute).Unix(),
+			IsFromMe:    true,
 		},
 	}
 
 	chats := []Chat{
 		{
 			ID:           "33123456789@s.whatsapp.net",
-			Name:         "+33123456789",
+			Name:         "Mom",
 			IsGroup:      false,
-			LastMessage:  time.Now().Add(-1 * time.Hour).Unix(),
-			MessageCount: 2,
+			LastMessage:  now.Add(-90 * time.Minute).Unix(),
+			MessageCount: 3,
 		},
 		{
 			ID:           "33987654321@s.whatsapp.net",
-			Name:         "+33987654321",
+			Name:         "Alex",
 			IsGroup:      false,
-			LastMessage:  time.Now().Add(-30 * time.Minute).Unix(),
+			LastMessage:  now.Add(-30 * time.Minute).Unix(),
+			MessageCount: 2,
+		},
+		{
+			ID:           "group123@g.us",
+			Name:         "Work Team",
+			IsGroup:      true,
+			LastMessage:  now.Add(-15 * time.Minute).Unix(),
 			MessageCount: 1,
+		},
+		{
+			ID:           "33555666777@s.whatsapp.net",
+			Name:         "Sarah",
+			IsGroup:      false,
+			LastMessage:  now.Add(-5 * time.Minute).Unix(),
+			MessageCount: 2,
 		},
 	}
 
-	log.Printf("✅ Generated %d sample messages from %d sample chats", len(messages), len(chats))
-	log.Printf("💡 Note: This is sample data. Real messages will appear here as they are received.")
+	log.Printf("✅ Generated %d realistic sample messages from %d sample chats", len(messages), len(chats))
+	log.Printf("💡 Note: This is sample data showing what real messages would look like.")
+	log.Printf("📱 To see real messages: send a message to +%s from another device", devicePhone)
 
 	return messages, chats, nil
 }
